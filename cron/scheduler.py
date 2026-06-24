@@ -149,7 +149,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, update_job
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -656,6 +656,74 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+def _backup_cron_artifact_to_github(job: dict, output_file: Path) -> Optional[str]:
+    """Best-effort backup of a saved cron artifact to GitHub.
+
+    Returns a GitHub blob URL when the artifact was copied/pushed successfully.
+    Failures are deliberately non-fatal: a transient GitHub/network issue should
+    not block the cron delivery itself. The daily catch-up backup job will retry
+    anything that failed here.
+    """
+    try:
+        script_path = _get_hermes_home() / "scripts" / "cron_artifact_backup.py"
+        if not script_path.exists():
+            logger.debug("Cron artifact backup script not found at %s", script_path)
+            return None
+
+        argv = [
+            sys.executable,
+            str(script_path),
+            "--file",
+            str(output_file),
+            "--job-id",
+            str(job.get("id", "")),
+        ]
+        if job.get("name"):
+            argv += ["--job-name", str(job.get("name"))]
+        if job.get("category"):
+            argv += ["--category", str(job.get("category"))]
+        if job.get("deliver"):
+            argv += ["--deliver", str(job.get("deliver"))]
+
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Job '%s': GitHub artifact backup failed: %s",
+                job.get("id", "?"),
+                (result.stderr or result.stdout or "unknown error").strip()[:1000],
+            )
+            return None
+        for line in reversed(result.stdout.splitlines()):
+            line = line.strip()
+            if line.startswith("https://github.com/"):
+                return line
+        logger.warning(
+            "Job '%s': GitHub artifact backup completed but produced no URL",
+            job.get("id", "?"),
+        )
+    except Exception as e:
+        logger.warning("Job '%s': GitHub artifact backup errored: %s", job.get("id", "?"), e)
+    return None
+
+
+def _append_artifact_link(content: str, artifact_url: Optional[str]) -> str:
+    """Append a human-clickable Markdown artifact link to cron delivery text."""
+    if not artifact_url:
+        return content
+    if artifact_url in content:
+        return content
+    suffix = (
+        "\n\n---\n\n"
+        f"**Markdown artifact:** [Open on GitHub]({artifact_url})"
+    )
+    return f"{content.rstrip()}{suffix}"
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -849,6 +917,50 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if delivery_errors:
         return "; ".join(delivery_errors)
     return None
+
+
+def _maybe_deliver_failure_escalation(job: Optional[dict], error: Optional[str], delivery_error: Optional[str], adapters=None, loop=None) -> None:
+    """Escalate persistent cron failures to the job origin without changing normal delivery.
+
+    mark_job_run() sets failure_escalation_pending after the fast retry budget
+    is exhausted.  Successful runs clear that state.  The normal cron result
+    still goes to job['deliver']; this separate message goes to origin/home so
+    the user is reminded to work with Hermes only when automation could not
+    resolve the failure by itself.
+    """
+    if not job or not job.get("failure_escalation_pending"):
+        return
+
+    job_id = job.get("id", "?")
+    job_name = job.get("name", job_id)
+    attempts = job.get("failure_escalation_attempts") or job.get("retry_attempts") or "?"
+    next_retry = job.get("failure_escalation_retry_at") or job.get("retry_next_run_at") or job.get("next_run_at") or "unknown"
+    reason = job.get("failure_escalation_reason") or error or delivery_error or "unknown failure"
+    normal_target = job.get("deliver", "local")
+
+    content = (
+        "⚠️ Cron job needs attention\n\n"
+        f"**Job:** {job_name}\n"
+        f"**Job ID:** `{job_id}`\n"
+        f"**Attempts:** {attempts}\n"
+        f"**Normal delivery target:** `{normal_target}`\n"
+        f"**Last error:** {reason}\n"
+        f"**Next automatic retry/reminder:** {next_retry}\n\n"
+        "I have already tried the fast automatic retry path. I will keep retrying on the watchdog cadence and will keep reminding Ming here until a successful run clears this. Reply to this DM and I will work through the fix with you."
+    )
+    # Escalations are for Ming, not for the job's normal target.  Use the
+    # Telegram home DM explicitly; `origin` can be a group/topic for jobs that
+    # were created from a non-DM context, which would fail the "escalate to me"
+    # contract.
+    escalation_job = {**job, "deliver": "telegram", "name": f"Escalation: {job_name}"}
+    escalation_error = _deliver_result(escalation_job, content, adapters=adapters, loop=loop)
+    if escalation_error:
+        logger.error("Job '%s': failure escalation delivery failed: %s", job_id, escalation_error)
+        return
+    update_job(job_id, {
+        "failure_escalation_pending": False,
+        "last_failure_escalated_at": _hermes_now().isoformat(),
+    })
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 120  # seconds
@@ -1879,13 +1991,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 
-## Prompt
-
-{prompt}
-
 ## Response
 
 {logged_response}
+
+---
+
+## Job Prompt / Run Configuration
+
+{prompt}
 """
         
         logger.info("Job '%s' completed successfully", job_name)
@@ -1901,15 +2015,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 
-## Prompt
-
-{prompt}
-
 ## Error
 
 ```
 {error_msg}
 ```
+
+---
+
+## Job Prompt / Run Configuration
+
+{prompt}
 """
         return False, output, "", error_msg
 
@@ -2053,10 +2169,15 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
 
+                artifact_url = _backup_cron_artifact_to_github(job, Path(output_file))
+                if verbose and artifact_url:
+                    logger.info("Artifact backed up to GitHub: %s", artifact_url)
+
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
                 # output is already saved above).  Failed jobs always deliver.
                 deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                deliver_content = _append_artifact_link(deliver_content, artifact_url)
                 # Treat whitespace-only final responses the same as empty
                 # responses: do not deliver a blank message, and let the
                 # empty-response guard below mark the run as a soft failure.
@@ -2080,12 +2201,14 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                updated_job = mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                _maybe_deliver_failure_escalation(updated_job, error, delivery_error, adapters=adapters, loop=loop)
                 return True
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
-                mark_job_run(job["id"], False, str(e))
+                updated_job = mark_job_run(job["id"], False, str(e))
+                _maybe_deliver_failure_escalation(updated_job, str(e), None, adapters=adapters, loop=loop)
                 return False
 
         # Partition due jobs: those with a per-job workdir mutate

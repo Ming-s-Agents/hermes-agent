@@ -59,6 +59,12 @@ _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+# Failed cron runs get a fast retry window first, then continue on a slower
+# watchdog cadence until a successful run clears the failure.  Fast retries
+# handle transient provider/network failures without user involvement; the
+# watchdog retry keeps the problem visible instead of silently giving up.
+FAILED_RUN_RETRY_DELAYS_SECONDS = [15 * 60, 45 * 60, 2 * 60 * 60]
+FAILED_RUN_WATCHDOG_RETRY_SECONDS = 6 * 60 * 60
 
 
 def _jobs_lock_file() -> Path:
@@ -970,12 +976,21 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
-                now = _hermes_now().isoformat()
+                now_dt = _hermes_now()
+                now = now_dt.isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                if success and not delivery_error:
+                    job.pop("retry_attempts", None)
+                    job.pop("retry_next_run_at", None)
+                    job.pop("retry_reason", None)
+                    job.pop("failure_escalation_pending", None)
+                    job.pop("failure_escalation_reason", None)
+                    job.pop("failure_escalation_retry_at", None)
+                    job.pop("failure_escalation_attempts", None)
                 
                 # Increment completed count
                 if job.get("repeat"):
@@ -990,8 +1005,55 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         save_jobs(jobs)
                         return
                 
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                retryable_failure = (not success) or bool(delivery_error)
+                retry_reason = error or delivery_error or "cron run failed"
+
+                # Compute next run.  On failed recurring runs, schedule fast
+                # retries first (15m, 45m, 2h), then continue retrying on a
+                # slower watchdog cadence.  The watchdog path also marks the
+                # run for origin escalation so the user is reminded until a
+                # successful run clears the failure state.
+                scheduled_next_run_at = compute_next_run(job["schedule"], now)
+                job["next_run_at"] = scheduled_next_run_at
+                schedule_kind = job.get("schedule", {}).get("kind")
+                if retryable_failure and schedule_kind in {"cron", "interval"}:
+                    try:
+                        retry_attempts = int(job.get("retry_attempts") or 0)
+                    except (TypeError, ValueError):
+                        retry_attempts = 0
+
+                    next_attempt = retry_attempts + 1
+                    if retry_attempts < len(FAILED_RUN_RETRY_DELAYS_SECONDS):
+                        delay_seconds = FAILED_RUN_RETRY_DELAYS_SECONDS[retry_attempts]
+                        # Escalate as soon as the fast retry budget has been
+                        # consumed. With the default [15m, 45m, 2h] window,
+                        # the third failed run still gets its 2h retry but it
+                        # also notifies the user that autonomous recovery has
+                        # not cleared the issue yet.
+                        escalate = next_attempt >= len(FAILED_RUN_RETRY_DELAYS_SECONDS)
+                    else:
+                        delay_seconds = FAILED_RUN_WATCHDOG_RETRY_SECONDS
+                        escalate = True
+
+                    retry_dt = now_dt + timedelta(seconds=delay_seconds)
+                    scheduled_dt = None
+                    if scheduled_next_run_at:
+                        try:
+                            scheduled_dt = _ensure_aware(datetime.fromisoformat(scheduled_next_run_at))
+                        except (TypeError, ValueError):
+                            scheduled_dt = None
+                    if scheduled_dt is None or retry_dt < scheduled_dt:
+                        job["next_run_at"] = retry_dt.isoformat()
+                        job["retry_next_run_at"] = job["next_run_at"]
+                    else:
+                        job.pop("retry_next_run_at", None)
+                    job["retry_reason"] = retry_reason
+                    job["retry_attempts"] = next_attempt
+                    if escalate:
+                        job["failure_escalation_pending"] = True
+                        job["failure_escalation_reason"] = retry_reason
+                        job["failure_escalation_retry_at"] = job.get("next_run_at")
+                        job["failure_escalation_attempts"] = next_attempt
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -1023,9 +1085,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return copy.deepcopy(job)
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        return None
 
 
 def advance_next_run(job_id: str) -> bool:

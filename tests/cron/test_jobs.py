@@ -469,8 +469,45 @@ class TestMarkJobRun:
         job = create_job(prompt="Fail", schedule="every 1h")
         mark_job_run(job["id"], success=False, error="timeout")
         updated = get_job(job["id"])
+        assert updated is not None
         assert updated["last_status"] == "error"
         assert updated["last_error"] == "timeout"
+        assert updated["retry_attempts"] == 1
+        assert updated["retry_reason"] == "timeout"
+        retry_dt = datetime.fromisoformat(updated["next_run_at"])
+        assert retry_dt <= datetime.now(retry_dt.tzinfo) + timedelta(minutes=16)
+
+    def test_success_clears_retry_state(self, tmp_cron_dir):
+        job = create_job(prompt="Flaky", schedule="every 1h")
+        mark_job_run(job["id"], success=False, error="timeout")
+        mark_job_run(job["id"], success=True)
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["last_status"] == "ok"
+        assert "retry_attempts" not in updated
+        assert "retry_next_run_at" not in updated
+        assert "retry_reason" not in updated
+
+    def test_failed_run_retries_continue_and_escalate_after_fast_budget(self, tmp_cron_dir):
+        job = create_job(prompt="Fail", schedule="every 1h")
+        for attempt in range(3):
+            mark_job_run(job["id"], success=False, error=f"timeout {attempt}")
+            updated = get_job(job["id"])
+            assert updated is not None
+            assert updated["retry_attempts"] == attempt + 1
+            assert updated["state"] == "scheduled"
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["failure_escalation_pending"] is True
+        assert updated["failure_escalation_attempts"] == 3
+        third_retry_at = updated["next_run_at"]
+        mark_job_run(job["id"], success=False, error="still failing")
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["retry_attempts"] == 4
+        assert updated["failure_escalation_pending"] is True
+        assert updated["failure_escalation_attempts"] == 4
+        assert updated["next_run_at"] != third_retry_at
 
     def test_delivery_error_tracked_separately(self, tmp_cron_dir):
         """Agent succeeds but delivery fails — both tracked independently."""
@@ -480,6 +517,19 @@ class TestMarkJobRun:
         assert updated["last_status"] == "ok"
         assert updated["last_error"] is None
         assert updated["last_delivery_error"] == "platform 'telegram' not configured"
+
+    def test_delivery_error_schedules_retry(self, tmp_cron_dir):
+        """Generated output that fails delivery should retry before the next normal run."""
+        job = create_job(prompt="Report", schedule="0 10 * * *")
+        mark_job_run(job["id"], success=True, delivery_error="Telegram send failed: Timed out")
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["last_status"] == "ok"
+        assert updated["last_delivery_error"] == "Telegram send failed: Timed out"
+        assert updated["retry_attempts"] == 1
+        assert updated["retry_reason"] == "Telegram send failed: Timed out"
+        retry_dt = datetime.fromisoformat(updated["next_run_at"])
+        assert retry_dt <= datetime.now(retry_dt.tzinfo) + timedelta(minutes=16)
 
     def test_delivery_error_cleared_on_success(self, tmp_cron_dir):
         """Successful delivery clears the previous delivery error."""
