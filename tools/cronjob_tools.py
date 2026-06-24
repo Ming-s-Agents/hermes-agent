@@ -432,6 +432,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     name = str(job.get("name") or prompt[:50] or (skills[0] if skills else "") or job_id or "cron job")
     result = {
         "job_id": job_id,
+        "owner_agent": job.get("owner_agent", "hermes"),
         "name": name,
         "skill": skills[0] if skills else None,
         "skills": skills,
