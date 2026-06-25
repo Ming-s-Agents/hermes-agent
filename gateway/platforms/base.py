@@ -3398,6 +3398,29 @@ class BasePlatformAdapter(ABC):
         lowered = error.lower()
         return "timed out" in lowered or "readtimeout" in lowered or "writetimeout" in lowered
 
+    @staticmethod
+    def _retry_after_seconds(error: Optional[str]) -> Optional[float]:
+        """Extract a server-requested flood-control wait from an error string.
+
+        Telegram returns messages like ``Flood control exceeded. Retry in 27
+        seconds`` / ``Retry after 27``.  The generic send retry loop must honor
+        that delay; otherwise it burns all attempts during the flood window and
+        reports a delivery failure even though waiting would have succeeded.
+        """
+        if not error:
+            return None
+        match = re.search(
+            r"retry\s+(?:in|after)\s+(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)?",
+            error,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        try:
+            return max(0.0, float(match.group(1)))
+        except (TypeError, ValueError):
+            return None
+
     def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
         """Unwrap a handler response into (text, ttl_seconds).
 
@@ -3457,9 +3480,13 @@ class BasePlatformAdapter(ABC):
             return result
 
         if is_network:
-            # Retry with exponential backoff for transient errors
+            # Retry with exponential backoff for transient errors.  If the
+            # platform provided an explicit flood-control Retry-After window,
+            # honor it instead of burning attempts during the refusal period.
             for attempt in range(1, max_retries + 1):
-                delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                retry_after = self._retry_after_seconds(error_str)
+                backoff_delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                delay = max(backoff_delay, (retry_after + 0.5) if retry_after is not None else 0.0)
                 logger.warning(
                     "[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s",
                     self.name, attempt, max_retries, delay, error_str,

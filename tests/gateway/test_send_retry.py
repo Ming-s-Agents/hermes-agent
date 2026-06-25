@@ -82,6 +82,17 @@ class TestIsRetryableError:
         assert _StubAdapter._is_retryable_error("ConnectTimeout: connection timed out")
 
 
+class TestRetryAfterParsing:
+    def test_retry_in_seconds(self):
+        assert _StubAdapter._retry_after_seconds("Flood control exceeded. Retry in 27 seconds") == 27.0
+
+    def test_retry_after_seconds(self):
+        assert _StubAdapter._retry_after_seconds("Retry after 1.5") == 1.5
+
+    def test_no_retry_after(self):
+        assert _StubAdapter._retry_after_seconds("httpx.ConnectError") is None
+
+
 # ---------------------------------------------------------------------------
 # _is_timeout_error
 # ---------------------------------------------------------------------------
@@ -188,6 +199,21 @@ class TestSendWithRetryNetworkRetry:
         with patch("asyncio.sleep", new_callable=AsyncMock):
             result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=0)
         assert result.success
+        assert len(adapter._send_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_honors_retry_after_delay(self):
+        """Flood-control Retry-After should override the normal short backoff."""
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error="Flood control exceeded. Retry in 27 seconds", retryable=True),
+            SendResult(success=True, message_id="ok"),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=0)
+        assert result.success
+        assert mock_sleep.await_args is not None
+        assert mock_sleep.await_args.args[0] >= 27.0
         assert len(adapter._send_calls) == 2
 
     @pytest.mark.asyncio
