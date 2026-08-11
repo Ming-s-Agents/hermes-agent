@@ -663,6 +663,19 @@ class TestBrowserExec:
         assert 'got:print("hi")' in result["output"]
         assert "session" not in result
 
+    def test_third_party_telemetry_is_opt_in(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("ANONYMIZED_TELEMETRY", raising=False)
+        monkeypatch.delenv("BROWSER_USE_CLOUD_SYNC", raising=False)
+        cli = _fake_cli(
+            tmp_path,
+            'cat > /dev/null\necho "telemetry:$ANONYMIZED_TELEMETRY cloud_sync:$BROWSER_USE_CLOUD_SYNC"\n',
+        )
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+
+        result = json.loads(bu_cli.browser_exec("print(1)"))
+
+        assert "telemetry:false cloud_sync:false" in result["output"]
+
     def test_session_sets_bu_name(self, tmp_path, monkeypatch):
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
