@@ -60,11 +60,15 @@ def _base_subprocess_env() -> dict:
     from tools.browser_tool import _build_browser_env
 
     env = _build_browser_env()
+<<<<<<< HEAD
     # Browser Use enables PostHog telemetry and cloud sync by default. Hermes
     # keeps third-party telemetry opt-in while preserving an explicit operator
     # choice inherited through the subprocess environment.
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
     env.setdefault("BROWSER_USE_CLOUD_SYNC", "false")
+=======
+    env.setdefault("ANONYMIZED_TELEMETRY", "false")
+>>>>>>> 49ac25921 (Disable Browser Use telemetry by default)
     return env
 
 
