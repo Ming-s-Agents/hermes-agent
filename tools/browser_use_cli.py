@@ -124,6 +124,7 @@ def _base_subprocess_env() -> dict:
     # the PATH so coreutils are always reachable (see below).
     env["PATH"] = _floor_subprocess_path(env.get("PATH", ""))
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
+    env.setdefault("BROWSER_USE_CLOUD_SYNC", "false")
     return env
 
 
